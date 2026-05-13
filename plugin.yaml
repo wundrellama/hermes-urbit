@@ -8,7 +8,7 @@ description: >
   a group chat channel and the Hermes agent. Uses SSE subscriptions for
   instant message delivery and JSON pokes for sending replies.
   Zero external dependencies beyond Hermes's existing aiohttp.
-author: Michael Riettini
+author: ~dinnyt-divsud
 
 requires_env:
   - name: URBIT_SHIP_URL
