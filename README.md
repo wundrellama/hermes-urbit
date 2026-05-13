@@ -1,4 +1,4 @@
-# hurbit
+# hermes-urbit
 
 Hermes Agent gateway plugin for Urbit. Enables bidirectional messaging between
 a Hermes AI agent and an Urbit group chat channel via Tlon Messenger.
