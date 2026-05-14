@@ -10,7 +10,7 @@ channels:
   - match: "Home Channel"
     type: chat
     users:
-      - "~labbel"
+      - "~sampel-palnet"
     cron_delivery: true
     reasoning_effort: high
     show_reasoning: true
@@ -23,7 +23,7 @@ channels:
       skills, show_reasoning). Changes take effect automatically on the next
       message. If a new channel was just created in Tlon, the user can type
       /rescan in any channel to discover and subscribe to it immediately.
-    notes: "Michael's admin channel"
+    notes: "Admin channel"
 
   - match: "Chat"
     type: chat

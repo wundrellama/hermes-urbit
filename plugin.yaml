@@ -1,51 +1,52 @@
-name: urbit-platform
-label: Urbit
-kind: platform
-version: 0.1.0
-description: >
-  Urbit gateway adapter for Hermes Agent.
-  Connects to an Urbit ship (moon) via Eyre HTTP and relays messages between
-  a group chat channel and the Hermes agent. Uses SSE subscriptions for
-  instant message delivery and JSON pokes for sending replies.
-  Zero external dependencies beyond Hermes's existing aiohttp.
-author: ~dinnyt-divsud
-
-requires_env:
-  - name: URBIT_SHIP_URL
-    description: "Moon's Eyre URL (e.g. https://your-moon.startram.io)"
-    prompt: "Urbit moon URL"
-    password: false
-  - name: URBIT_SHIP_NAME
-    description: "Moon's @p identity (e.g. ~sampel-palnet-sampel-palnet)"
-    prompt: "Moon ship name (@p)"
-    password: false
-  - name: URBIT_ACCESS_CODE
-    description: "Moon's +code output (8-syllable access code)"
-    prompt: "Access code"
-    password: true
-  - name: URBIT_OWNER_SHIP
-    description: "Planet that owns this moon and hosts the C&C group (e.g. ~sampel-palnet)"
-    prompt: "Owner planet (@p)"
-    password: false
-
-optional_env:
-  - name: URBIT_GROUP_NAME
-    description: "Group title to match if moon is in multiple groups (default: first group by owner)"
-    prompt: "Group name (optional)"
-    password: false
-  - name: URBIT_MENTION_TRIGGERS
-    description: "Comma-separated trigger strings; only respond when one appears in message (empty = respond to all)"
-    prompt: "Mention triggers (optional, comma-separated)"
-    password: false
-  - name: URBIT_HOME_CHANNEL
-    description: "Override auto-discovered channel nest for cron delivery (usually auto-detected)"
-    prompt: "Home channel nest override (optional)"
-    password: false
-  - name: URBIT_ALLOWED_USERS
-    description: "Comma-separated @p ships allowed to talk (empty = all group members)"
-    prompt: "Allowed ships (optional, comma-separated)"
-    password: false
-  - name: URBIT_ALLOW_ALL_USERS
-    description: "Allow any ship, not just group members (true/false, default: false)"
-    prompt: "Allow all users? (true/false)"
-    password: false
+     1|name: urbit-platform
+     2|label: Urbit
+     3|kind: platform
+     4|version: 0.1.0
+     5|description: >
+     6|  Urbit gateway adapter for Hermes Agent.
+     7|  Connects to an Urbit ship (moon) via Eyre HTTP and relays messages between
+     8|  a group chat channel and the Hermes agent. Uses SSE subscriptions for
+     9|  instant message delivery and JSON pokes for sending replies.
+    10|  Zero external dependencies beyond Hermes's existing aiohttp.
+    11|author: hurbit contributors
+    12|
+    13|requires_env:
+    14|  - name: URBIT_SHIP_URL
+    15|    description: "Moon's Eyre URL (e.g. https://your-moon.startram.io)"
+    16|    prompt: "Urbit moon URL"
+    17|    password: false
+    18|  - name: URBIT_SHIP_NAME
+    19|    description: "Moon's @p identity (e.g. ~sampel-palnet-sampel-palnet)"
+    20|    prompt: "Moon ship name (@p)"
+    21|    password: false
+    22|  - name: URBIT_ACCESS_CODE
+    23|    description: "Moon's +code output (8-syllable access code)"
+    24|    prompt: "Access code"
+    25|    password: true
+    26|  - name: URBIT_OWNER_SHIP
+    27|    description: "Planet that owns this moon and hosts the C&C group (e.g. ~sampel-palnet)"
+    28|    prompt: "Owner planet (@p)"
+    29|    password: false
+    30|
+    31|optional_env:
+    32|  - name: URBIT_GROUP_NAME
+    33|    description: "Group title to match if moon is in multiple groups (default: first group by owner)"
+    34|    prompt: "Group name (optional)"
+    35|    password: false
+    36|  - name: URBIT_MENTION_TRIGGERS
+    37|    description: "Comma-separated trigger strings; only respond when one appears in message (empty = respond to all)"
+    38|    prompt: "Mention triggers (optional, comma-separated)"
+    39|    password: false
+    40|  - name: URBIT_HOME_CHANNEL
+    41|    description: "Override auto-discovered channel nest for cron delivery (usually auto-detected)"
+    42|    prompt: "Home channel nest override (optional)"
+    43|    password: false
+    44|  - name: URBIT_ALLOWED_USERS
+    45|    description: "Comma-separated @p ships allowed to talk (empty = all group members)"
+    46|    prompt: "Allowed ships (optional, comma-separated)"
+    47|    password: false
+    48|  - name: URBIT_ALLOW_ALL_USERS
+    49|    description: "Allow any ship, not just group members (true/false, default: false)"
+    50|    prompt: "Allow all users? (true/false)"
+    51|    password: false
+    52|

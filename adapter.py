@@ -893,6 +893,7 @@ class UrbitAdapter(BasePlatformAdapter):
         event = MessageEvent(
             text=text or "[image]",
             message_type=msg_type,
+            message_id=post_id or None,
             source=source,
             raw_message={"post_id": post_id, "essay": essay, "nest": nest},
             media_urls=media_urls,
@@ -955,6 +956,48 @@ class UrbitAdapter(BasePlatformAdapter):
                     if src:
                         urls.append(src)
         return urls
+
+    # ── Kind-Data Builder ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_kind_data(
+        chan_type: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build the kind-data object for a channel-action poke (v7 format).
+
+        Chat:  {"chat": null}
+        Heap:  {"heap": null}  (or {"heap": "optional title"})
+        Diary: {"diary": {"title": "...", "image": ""}}
+
+        For diary, title is pulled from metadata["title"] if present,
+        otherwise auto-generated from the first line of content (max 80 chars).
+        """
+        meta = metadata or {}
+
+        if chan_type == "diary":
+            title = meta.get("title", "")
+            if not title:
+                # Auto-generate from first line of content
+                first_line = content.split("\n", 1)[0].strip()
+                # Strip markdown heading markers
+                first_line = first_line.lstrip("# ").strip()
+                if len(first_line) > 80:
+                    title = first_line[:77] + "..."
+                else:
+                    title = first_line or "Untitled"
+            image = meta.get("image", "")
+            return {"diary": {"title": title, "image": image}}
+
+        elif chan_type == "heap":
+            # Heap posts can have an optional title string
+            heap_title = meta.get("title")
+            return {"heap": heap_title}  # None = no title
+
+        else:
+            # Default: chat
+            return {"chat": None}
 
     # ── Commands ────────────────────────────────────────────────────────────
 
@@ -1053,23 +1096,60 @@ class UrbitAdapter(BasePlatformAdapter):
         if not show_reasoning:
             content = self._strip_reasoning_block(content)
 
+        # Determine channel type and build appropriate kind-data
+        chan_type = chan_info.get("type", "chat")  # chat, heap, or diary
+
         # Build the channel-action poke payload
         now_ms = int(time.time() * 1000)
-        poke_json = {
-            "channel": {
-                "nest": nest,
-                "action": {
-                    "post": {
-                        "add": {
-                            "author": self.ship_name,
-                            "sent": now_ms,
-                            "content": [{"inline": [content]}],
-                            "kind-data": {"chat": None},
+
+        # For diary/heap channels with a reply_to post ID, respond as a
+        # comment under the original post rather than creating a new entry.
+        # Replies use "memo" (content + author + sent) — no kind-data.
+        # Chat channels always create top-level posts (no reply threading).
+        use_reply = (
+            reply_to
+            and chan_type in ("diary", "heap")
+        )
+
+        if use_reply:
+            # Reply poke: {channel: {nest, action: {post: {reply: {id, action: {add: memo}}}}}}
+            poke_json = {
+                "channel": {
+                    "nest": nest,
+                    "action": {
+                        "post": {
+                            "reply": {
+                                "id": reply_to,
+                                "action": {
+                                    "add": {
+                                        "content": [{"inline": [content]}],
+                                        "author": self.ship_name,
+                                        "sent": now_ms,
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
+        else:
+            # Top-level post poke (chat, or diary/heap when creating a new entry)
+            kind_data = self._build_kind_data(chan_type, content, metadata)
+            poke_json = {
+                "channel": {
+                    "nest": nest,
+                    "action": {
+                        "post": {
+                            "add": {
+                                "author": self.ship_name,
+                                "sent": now_ms,
+                                "content": [{"inline": [content]}],
+                                "kind-data": kind_data,
+                            }
+                        }
+                    }
+                }
+            }
 
         # Send via Eyre channel poke
         poke_payload = json.dumps([{
@@ -1094,7 +1174,12 @@ class UrbitAdapter(BasePlatformAdapter):
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status in (200, 204):
-                    logger.info("Urbit: sent message (%d chars)", len(content))
+                    action = "reply" if use_reply else "post"
+                    logger.info(
+                        "Urbit: sent %s %s (%d chars) to %s",
+                        chan_type, action, len(content),
+                        chan_info.get("title", nest),
+                    )
                     return SendResult(success=True)
                 else:
                     logger.error("Urbit: send failed (HTTP %d)", resp.status)
