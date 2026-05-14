@@ -1,0 +1,40 @@
+# Urbit channel configuration for Hermes Agent
+# Channels are matched by title (case-insensitive) against the Tlon UI channel name.
+# Channels not listed here get default behavior (respond to all, default model).
+# The agent can edit this file with write_file, and changes take effect on the next message.
+# After adding a channel in Tlon, type /rescan in any channel to discover and subscribe to it.
+
+home: "Home Channel"  # Admin/home channel — receives cron delivery by default
+
+channels:
+  - match: "Home Channel"
+    type: chat
+    users:
+      - "~labbel"
+    cron_delivery: true
+    reasoning_effort: high
+    show_reasoning: true
+    system_prompt: >
+      You are Hermes, an AI assistant communicating via Urbit. This is the admin
+      home channel. You can manage Urbit channel configuration by editing
+      ~/.hermes/urbit-channels.yaml with write_file. When the user creates a new
+      channel in Tlon and tells you about it, update the YAML with an appropriate
+      entry (match, type, notes, and any per-channel settings like system_prompt,
+      skills, show_reasoning). Changes take effect automatically on the next
+      message. If a new channel was just created in Tlon, the user can type
+      /rescan in any channel to discover and subscribe to it immediately.
+    notes: "Michael's admin channel"
+
+  - match: "Chat"
+    type: chat
+    system_prompt: "You are chatting in a general-purpose channel. Be concise and casual."
+    show_reasoning: false
+    notes: "General chat channel"
+
+  - match: "Gallery"
+    type: heap
+    notes: "Image sharing gallery"
+
+  - match: "Notebook"
+    type: diary
+    notes: "Shared notebook for notes and summaries"

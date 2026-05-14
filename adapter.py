@@ -2,9 +2,13 @@
 Urbit Platform Adapter for Hermes Agent.
 
 A plugin-based gateway adapter that connects to an Urbit ship (moon) via
-Eyre HTTP and relays messages between a group chat channel and the Hermes
+Eyre HTTP and relays messages between group chat channels and the Hermes
 agent. Uses SSE subscriptions for instant message delivery and JSON pokes
 for sending replies.
+
+Supports multi-channel subscriptions with per-channel configuration via
+~/.hermes/urbit-channels.yaml. Each channel gets its own isolated agent
+session keyed by its nest (e.g. chat/~host/slug).
 
 Zero external dependencies beyond Hermes's existing aiohttp.
 
@@ -23,6 +27,7 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
@@ -47,12 +52,17 @@ from gateway.config import PlatformConfig, Platform
 class UrbitAdapter(BasePlatformAdapter):
     """Async Urbit adapter implementing the BasePlatformAdapter interface.
 
-    Connects to an Urbit ship via Eyre HTTP, auto-discovers the group chat
-    channel, subscribes via SSE for incoming messages, and sends replies
+    Connects to an Urbit ship via Eyre HTTP, auto-discovers group chat
+    channels, subscribes via SSE for incoming messages, and sends replies
     via JSON poke with the channel-action mark.
+
+    Supports multi-channel subscriptions: all chat channels in the owner's
+    group are discovered and subscribed. Per-channel config is loaded from
+    ~/.hermes/urbit-channels.yaml.
     """
 
     MAX_MESSAGE_LENGTH = 10000  # Tlon chat chunk limit
+    CHANNELS_YAML_FILENAME = "urbit-channels.yaml"
 
     def __init__(self, config, **kwargs):
         platform = Platform("urbit")
@@ -75,12 +85,23 @@ class UrbitAdapter(BasePlatformAdapter):
 
         # Runtime state
         self._cookie: Optional[str] = None
-        self._channel_nest: Optional[str] = None
         self._eyre_channel_id: Optional[str] = None
         self._sse_task: Optional[asyncio.Task] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._event_id_counter = 0
         self._last_acked_event = -1
+
+        # Multi-channel state
+        # {nest: {title, type, group_flag, config}} — discovered channels + YAML config overlay
+        self._channels: Dict[str, Dict[str, Any]] = {}
+        # The nest of the home/admin channel
+        self._home_channel: Optional[str] = None
+        # Reverse map: subscription_id → nest (for routing SSE events)
+        self._sub_id_to_nest: Dict[int, str] = {}
+        # Channel YAML config (raw parsed dict)
+        self._channel_configs: List[Dict[str, Any]] = []
+        self._channel_yaml_home: Optional[str] = None  # "home" field from YAML
+        self._channel_yaml_mtime: float = 0.0  # Last known mtime for hot-reload
 
     @property
     def name(self) -> str:
@@ -146,18 +167,194 @@ class UrbitAdapter(BasePlatformAdapter):
             logger.error("Urbit: authentication error — %s", e)
             return False
 
+    # ── Channel Configuration ───────────────────────────────────────────────
+
+    def _get_channel_yaml_path(self) -> Path:
+        """Return the path to the channel YAML config file."""
+        try:
+            from hermes_constants import get_hermes_home
+            return get_hermes_home() / self.CHANNELS_YAML_FILENAME
+        except ImportError:
+            return Path.home() / ".hermes" / self.CHANNELS_YAML_FILENAME
+
+    def _load_channel_yaml(self) -> None:
+        """Load per-channel config from ~/.hermes/urbit-channels.yaml.
+
+        Sets self._channel_configs (list of channel dicts) and
+        self._channel_yaml_home (name of the home/admin channel).
+        Missing file or parse errors result in empty config (all defaults).
+        """
+        yaml_path = self._get_channel_yaml_path()
+
+        if not yaml_path.exists():
+            logger.info("Urbit: no %s found — using defaults for all channels", yaml_path)
+            self._channel_configs = []
+            self._channel_yaml_home = None
+            return
+
+        try:
+            import yaml
+            with open(yaml_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.warning("Urbit: failed to parse %s — %s (using defaults)", yaml_path, e)
+            self._channel_configs = []
+            self._channel_yaml_home = None
+            return
+
+        self._channel_yaml_home = str(data.get("home", "")).strip() or None
+        raw_channels = data.get("channels", [])
+        if not isinstance(raw_channels, list):
+            logger.warning("Urbit: 'channels' in YAML is not a list — ignoring")
+            raw_channels = []
+
+        self._channel_configs = raw_channels
+        logger.info(
+            "Urbit: loaded %d channel configs from %s (home=%s)",
+            len(self._channel_configs), yaml_path, self._channel_yaml_home,
+        )
+        # Track mtime for hot-reload detection
+        try:
+            self._channel_yaml_mtime = yaml_path.stat().st_mtime
+        except OSError:
+            self._channel_yaml_mtime = 0.0
+
+    def _match_channel_config(self, title: str) -> Dict[str, Any]:
+        """Find the YAML config entry matching a channel title.
+
+        Returns the matching config dict, or {} if no match.
+        Match is case-insensitive on the 'match' field.
+        """
+        title_lower = title.lower()
+        for cfg in self._channel_configs:
+            match_str = str(cfg.get("match", "")).strip()
+            if match_str and match_str.lower() == title_lower:
+                return cfg
+        return {}
+
+    def _maybe_reload_yaml(self) -> bool:
+        """Check if the YAML config file changed and reload if needed.
+
+        Called on each inbound message — cheap (single stat() call).
+        Returns True if config was reloaded and channel configs may have changed.
+        """
+        yaml_path = self._get_channel_yaml_path()
+        try:
+            current_mtime = yaml_path.stat().st_mtime
+        except OSError:
+            return False
+
+        if current_mtime <= self._channel_yaml_mtime:
+            return False
+
+        logger.info("Urbit: detected YAML config change, reloading...")
+        old_configs = {cfg.get("match", ""): cfg for cfg in self._channel_configs}
+        self._load_channel_yaml()
+
+        # Re-apply YAML configs to already-discovered channels
+        for nest, chan_info in self._channels.items():
+            title = chan_info.get("title", "")
+            if title:
+                chan_info["config"] = self._match_channel_config(title)
+
+        # Check if home channel resolution changed
+        new_home = self._resolve_home_channel()
+        if new_home != self._home_channel:
+            self._home_channel = new_home
+            logger.info("Urbit: home channel updated → %s", self._home_channel)
+
+        return True
+
+    async def rescan_channels(self) -> Dict[str, List[str]]:
+        """Re-discover channels and subscribe to any new ones.
+
+        Returns {"added": [nest, ...], "removed": [nest, ...], "unchanged": [nest, ...]}.
+        Does NOT unsubscribe from removed channels (Eyre doesn't support
+        selective unsubscribe on an existing channel cleanly).
+        """
+        if not self._cookie or not self._session:
+            return {"added": [], "removed": [], "unchanged": [], "error": "Not connected"}
+
+        # Reload YAML first
+        self._load_channel_yaml()
+
+        # Re-discover all channels
+        new_channels = await self._discover_all_channels()
+        if not new_channels:
+            return {"added": [], "removed": [], "unchanged": [], "error": "Discovery returned no channels"}
+
+        old_nests = set(self._channels.keys())
+        new_nests = set(new_channels.keys())
+
+        added = new_nests - old_nests
+        removed = old_nests - new_nests
+        unchanged = old_nests & new_nests
+
+        # Update channel map
+        self._channels = new_channels
+        self._home_channel = self._resolve_home_channel()
+
+        # Subscribe to newly discovered channels on the existing Eyre channel
+        if added and self._eyre_channel_id:
+            actions = []
+            for nest in added:
+                subscribe_path = f"/v1/{nest}"
+                sub_id = self._event_id_counter
+                actions.append({
+                    "id": sub_id,
+                    "action": "subscribe",
+                    "ship": self._ship_name_no_sig(),
+                    "app": "channels",
+                    "path": subscribe_path,
+                })
+                self._sub_id_to_nest[sub_id] = nest
+                self._event_id_counter += 1
+
+            payload = json.dumps(actions)
+            channel_url = self._url(f"/~/channel/{self._eyre_channel_id}")
+            try:
+                async with self._session.post(
+                    channel_url,
+                    data=payload,
+                    headers={
+                        "Cookie": self._cookie,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status in (200, 204):
+                        logger.info("Urbit: subscribed to %d new channels: %s", len(added), list(added))
+                    else:
+                        logger.error("Urbit: failed to subscribe to new channels (HTTP %d)", resp.status)
+            except Exception as e:
+                logger.error("Urbit: failed to subscribe to new channels — %s", e)
+
+        result = {
+            "added": sorted(added),
+            "removed": sorted(removed),
+            "unchanged": sorted(unchanged),
+        }
+
+        if added:
+            for nest in added:
+                info = self._channels.get(nest, {})
+                logger.info("Urbit: new channel '%s' [%s] subscribed", info.get("title", nest), nest)
+        if removed:
+            for nest in removed:
+                logger.info("Urbit: channel %s no longer in group (will stop receiving on next reconnect)", nest)
+
+        return result
+
     # ── Channel Discovery ──────────────────────────────────────────────────
 
-    async def _discover_channel(self) -> Optional[str]:
-        """Auto-discover the group chat channel.
+    async def _discover_all_channels(self) -> Dict[str, Dict[str, Any]]:
+        """Discover all channels in the owner's group.
 
-        Logic:
-        1. Scry groups/groups/light.json → find groups hosted by owner_ship
-        2. If group_name set, match by title; else pick first match
-        3. Scry channels/channels.json → find first chat/ channel in that group
-        4. Return the channel nest string
+        Returns {nest: {title, type, group_flag, config}, ...}
+        where 'config' is the matching YAML config entry (or {}).
 
-        Returns None on failure.
+        Scries groups/groups/light.json to find the group flag, then
+        channels/channels.json to enumerate channels in that group.
         """
         # Step 1: Find the group
         groups_url = self._url("/~/scry/groups/groups/light.json")
@@ -169,14 +366,13 @@ class UrbitAdapter(BasePlatformAdapter):
             ) as resp:
                 if resp.status != 200:
                     logger.error("Urbit: failed to scry groups (HTTP %d)", resp.status)
-                    return None
+                    return {}
                 groups_data = await resp.json()
         except Exception as e:
             logger.error("Urbit: failed to scry groups — %s", e)
-            return None
+            return {}
 
-        # groups_data is {flag: group_info, ...}
-        # Filter for groups where flag starts with owner_ship
+        # Filter for groups hosted by owner_ship
         owner_prefix = f"{self.owner_ship}/"
         matching_flags = [
             flag for flag in groups_data.keys()
@@ -188,7 +384,7 @@ class UrbitAdapter(BasePlatformAdapter):
                 "Urbit: no groups found hosted by %s (found: %s)",
                 self.owner_ship, list(groups_data.keys())
             )
-            return None
+            return {}
 
         # If group_name specified, match by title
         target_flag = None
@@ -211,7 +407,25 @@ class UrbitAdapter(BasePlatformAdapter):
 
         logger.info("Urbit: discovered group %s", target_flag)
 
-        # Step 2: Find chat channel in this group
+        # Step 2: Get channel metadata (titles, descriptions) from the group
+        # The full group scry includes a 'channels' map with per-channel meta
+        group_channels_meta: Dict[str, Dict] = {}
+        group_detail_url = self._url(f"/~/scry/groups/groups/{target_flag}.json")
+        try:
+            async with self._session.get(
+                group_detail_url,
+                headers={"Cookie": self._cookie},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    group_detail = await resp.json()
+                    group_channels_meta = group_detail.get("channels", {})
+                else:
+                    logger.warning("Urbit: failed to scry group detail (HTTP %d) — titles unavailable", resp.status)
+        except Exception as e:
+            logger.warning("Urbit: failed to scry group detail — %s (titles unavailable)", e)
+
+        # Step 3: Scry all channels (for perms/group membership filtering)
         channels_url = self._url("/~/scry/channels/channels.json")
         try:
             async with self._session.get(
@@ -221,35 +435,55 @@ class UrbitAdapter(BasePlatformAdapter):
             ) as resp:
                 if resp.status != 200:
                     logger.error("Urbit: failed to scry channels (HTTP %d)", resp.status)
-                    return None
+                    return {}
                 channels_data = await resp.json()
         except Exception as e:
             logger.error("Urbit: failed to scry channels — %s", e)
-            return None
+            return {}
 
-        # channels_data is {nest: channel_info, ...}
-        # Find first chat/ channel whose perms.group matches our target_flag
+        # Step 4: Filter channels belonging to our group and build the map
+        result: Dict[str, Dict[str, Any]] = {}
         for nest, chan_info in channels_data.items():
-            if not nest.startswith("chat/"):
-                continue
             perms = chan_info.get("perms", {})
-            if perms.get("group") == target_flag:
-                logger.info("Urbit: discovered channel %s", nest)
-                return nest
+            if perms.get("group") != target_flag:
+                continue
 
-        # Fallback: find a chat channel hosted by the owner ship
-        for nest in channels_data.keys():
-            if nest.startswith(f"chat/{self.owner_ship}/"):
-                logger.info("Urbit: discovered channel %s (fallback by host)", nest)
-                return nest
+            # Determine channel type from nest prefix
+            chan_type = nest.split("/")[0] if "/" in nest else "unknown"
 
-        logger.error("Urbit: no chat channel found in group %s", target_flag)
-        return None
+            # Get title from GROUP metadata (not from channels agent — it doesn't have titles)
+            title = ""
+            group_chan_meta = group_channels_meta.get(nest, {})
+            if group_chan_meta:
+                meta = group_chan_meta.get("meta", {})
+                title = meta.get("title", "") if isinstance(meta, dict) else ""
+
+            # Match against YAML config
+            config_entry = self._match_channel_config(title) if title else {}
+
+            result[nest] = {
+                "title": title,
+                "type": chan_type,
+                "group_flag": target_flag,
+                "config": config_entry,
+            }
+
+        if not result:
+            logger.error("Urbit: no channels found in group %s", target_flag)
+        else:
+            for nest, info in result.items():
+                cfg_note = " (configured)" if info["config"] else ""
+                logger.info(
+                    "Urbit: discovered %s '%s' [%s]%s",
+                    info["type"], info["title"] or nest, nest, cfg_note,
+                )
+
+        return result
 
     # ── Connection Lifecycle ───────────────────────────────────────────────
 
     async def connect(self) -> bool:
-        """Connect to Urbit: authenticate, discover channel, start SSE listener."""
+        """Connect to Urbit: authenticate, discover channels, start SSE listener."""
         if not self.ship_url or not self.ship_name or not self.access_code:
             logger.error("Urbit: URBIT_SHIP_URL, URBIT_SHIP_NAME, and URBIT_ACCESS_CODE must be set")
             self._set_fatal_error(
@@ -268,6 +502,9 @@ class UrbitAdapter(BasePlatformAdapter):
             )
             return False
 
+        # Load per-channel YAML config (before discovery so matches work)
+        self._load_channel_yaml()
+
         # Create aiohttp session
         self._session = aiohttp.ClientSession()
 
@@ -277,32 +514,72 @@ class UrbitAdapter(BasePlatformAdapter):
             self._set_fatal_error("auth_failed", "Failed to authenticate to Urbit ship", retryable=True)
             return False
 
-        # Discover channel (use override if set)
-        if self.home_channel_override:
-            self._channel_nest = self.home_channel_override
-            logger.info("Urbit: using configured channel %s", self._channel_nest)
-        else:
-            self._channel_nest = await self._discover_channel()
-            if not self._channel_nest:
-                await self._session.close()
-                self._set_fatal_error(
-                    "discovery_failed",
-                    "Could not auto-discover group chat channel",
-                    retryable=True,
-                )
-                return False
+        # Discover all channels in the group
+        self._channels = await self._discover_all_channels()
+        if not self._channels:
+            await self._session.close()
+            self._set_fatal_error(
+                "discovery_failed",
+                "Could not discover any channels in the group",
+                retryable=True,
+            )
+            return False
 
-        logger.info("Urbit: connected — channel %s", self._channel_nest)
+        # Determine the home channel
+        self._home_channel = self._resolve_home_channel()
+        logger.info("Urbit: home channel → %s", self._home_channel)
 
-        # Open Eyre channel and start SSE listener
+        # Open Eyre channel and subscribe to all discovered channels
         if not await self._open_eyre_channel():
             await self._session.close()
             self._set_fatal_error("sse_failed", "Failed to open Eyre SSE channel", retryable=True)
             return False
 
         self._sse_task = asyncio.create_task(self._sse_listener())
-        logger.info("Urbit: SSE listener started")
+        logger.info(
+            "Urbit: connected — %d channels subscribed (%s)",
+            len(self._channels), ", ".join(self._channels.keys()),
+        )
         return True
+
+    def _resolve_home_channel(self) -> Optional[str]:
+        """Determine which nest is the home/admin channel.
+
+        Priority:
+        1. URBIT_HOME_CHANNEL env var (exact nest override)
+        2. YAML 'home' field matched against channel titles
+        3. First chat/ channel (fallback)
+        """
+        # 1. Explicit override
+        if self.home_channel_override:
+            if self.home_channel_override in self._channels:
+                return self.home_channel_override
+            # Try matching as a title
+            for nest, info in self._channels.items():
+                if info["title"].lower() == self.home_channel_override.lower():
+                    return nest
+            logger.warning(
+                "Urbit: URBIT_HOME_CHANNEL '%s' not found, falling back",
+                self.home_channel_override,
+            )
+
+        # 2. YAML 'home' field
+        if self._channel_yaml_home:
+            for nest, info in self._channels.items():
+                if info["title"].lower() == self._channel_yaml_home.lower():
+                    return nest
+            logger.warning(
+                "Urbit: YAML home '%s' not found among channels",
+                self._channel_yaml_home,
+            )
+
+        # 3. First chat/ channel
+        for nest in self._channels:
+            if nest.startswith("chat/"):
+                return nest
+
+        # 4. Any channel at all
+        return next(iter(self._channels), None)
 
     async def disconnect(self):
         """Disconnect from Urbit, clean up resources."""
@@ -317,34 +594,48 @@ class UrbitAdapter(BasePlatformAdapter):
             await self._session.close()
 
         self._cookie = None
-        self._channel_nest = None
+        self._channels = {}
+        self._home_channel = None
         self._eyre_channel_id = None
+        self._sub_id_to_nest = {}
         logger.info("Urbit: disconnected")
 
     # ── Eyre Channel & SSE ─────────────────────────────────────────────────
 
     async def _open_eyre_channel(self) -> bool:
-        """Open an Eyre channel and subscribe to the group chat channel.
+        """Open an Eyre channel and subscribe to all discovered channels.
 
-        Returns True on successful subscription, False on failure.
+        Creates a single Eyre channel and sends one subscribe action per
+        discovered channel nest. Builds the _sub_id_to_nest map for routing.
+
+        Returns True on success, False on failure.
         """
         self._eyre_channel_id = self._new_channel_id()
         self._event_id_counter = 1
+        self._sub_id_to_nest = {}
 
-        # Subscribe to the channels agent for our specific chat channel
-        # Path format: /v1/chat/~host/slug
-        # Nest format: chat/~host/slug → path needs /v1/ prefix
-        subscribe_path = f"/v1/{self._channel_nest}"
+        # Build subscribe actions for all channels
+        actions = []
+        for nest in self._channels:
+            # Path format: /v1/chat/~host/slug (prefix nest type with /v1/)
+            subscribe_path = f"/v1/{nest}"
+            sub_id = self._event_id_counter
 
-        payload = json.dumps([{
-            "id": self._event_id_counter,
-            "action": "subscribe",
-            "ship": self._ship_name_no_sig(),
-            "app": "channels",
-            "path": subscribe_path,
-        }])
-        self._event_id_counter += 1
+            actions.append({
+                "id": sub_id,
+                "action": "subscribe",
+                "ship": self._ship_name_no_sig(),
+                "app": "channels",
+                "path": subscribe_path,
+            })
+            self._sub_id_to_nest[sub_id] = nest
+            self._event_id_counter += 1
 
+        if not actions:
+            logger.error("Urbit: no channels to subscribe to")
+            return False
+
+        payload = json.dumps(actions)
         channel_url = self._url(f"/~/channel/{self._eyre_channel_id}")
         try:
             async with self._session.post(
@@ -363,8 +654,10 @@ class UrbitAdapter(BasePlatformAdapter):
             logger.error("Urbit: failed to open Eyre channel — %s", e)
             return False
 
-        logger.info("Urbit: Eyre channel %s opened, subscribed to %s",
-                    self._eyre_channel_id, subscribe_path)
+        logger.info(
+            "Urbit: Eyre channel %s opened, %d subscriptions sent",
+            self._eyre_channel_id, len(actions),
+        )
         return True
 
     async def _ack_event(self, event_id: int):
@@ -420,12 +713,16 @@ class UrbitAdapter(BasePlatformAdapter):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
 
-            # Re-authenticate and re-subscribe
+            # Re-authenticate and re-subscribe to all channels
             try:
                 if await self._authenticate():
-                    if await self._open_eyre_channel():
-                        backoff = 1  # Reset on success
-                        continue
+                    # Re-discover channels (group may have changed)
+                    self._channels = await self._discover_all_channels()
+                    if self._channels:
+                        self._home_channel = self._resolve_home_channel()
+                        if await self._open_eyre_channel():
+                            backoff = 1  # Reset on success
+                            continue
                 logger.error("Urbit: reconnection failed, will retry")
             except asyncio.CancelledError:
                 return
@@ -475,10 +772,12 @@ class UrbitAdapter(BasePlatformAdapter):
 
         # Check for subscription confirmation
         if data.get("response") == "subscribe":
+            sub_id = data.get("id")
+            nest = self._sub_id_to_nest.get(sub_id, "?")
             if "ok" in data:
-                logger.info("Urbit: subscription confirmed (id=%s)", data.get("id"))
+                logger.info("Urbit: subscription confirmed for %s (id=%s)", nest, sub_id)
             elif "err" in data:
-                logger.error("Urbit: subscription failed — %s", data.get("err", "")[:200])
+                logger.error("Urbit: subscription failed for %s — %s", nest, data.get("err", "")[:200])
             return
 
         # Check for poke acknowledgment
@@ -492,11 +791,21 @@ class UrbitAdapter(BasePlatformAdapter):
             await self._handle_channel_event(data["json"])
 
     async def _handle_channel_event(self, event_json: dict):
-        """Handle a channel-response-2 event containing a new post."""
+        """Handle a channel-response-2 event containing a new post.
+
+        The event JSON includes a 'nest' field identifying which channel
+        this message belongs to, enabling multi-channel routing.
+        """
         # Expected structure:
         # {"nest": "chat/~host/slug", "response": {"post": {"id": "...",
         #   "r-post": {"set": {"essay": {"author": "~ship", "sent": N,
-        #   "content": [...], "kind-data": {"chat": null}}, "type": "post"}}}}}
+        #   "content": [...], "kind-data": {"chat": null}}, "type": "post"}}}}
+
+        # Extract nest for routing — this identifies the channel
+        nest = event_json.get("nest", "")
+
+        # Hot-reload YAML config if the file changed (cheap stat() check)
+        self._maybe_reload_yaml()
 
         response = event_json.get("response", {})
         post_data = response.get("post")
@@ -523,34 +832,76 @@ class UrbitAdapter(BasePlatformAdapter):
 
         # Extract text content from Story format
         text = self._extract_text_from_content(content)
-        if not text:
+        image_urls = self._extract_image_urls_from_content(content)
+        if not text and not image_urls:
+            return
+
+        # Handle /rescan command — intercept before reaching the gateway
+        if text and text.strip().lower() == "/rescan":
+            await self._handle_rescan_command(nest, author)
             return
 
         # Apply mention triggers filter
         if self.mention_triggers:
-            text_lower = text.lower()
+            text_lower = (text or "").lower()
             if not any(trigger in text_lower for trigger in self.mention_triggers):
                 return
 
-        # Build message event and dispatch to gateway
-        timestamp = sent / 1000.0 if sent > 1_000_000_000_000 else sent
+        # Download images to local cache for vision tool access
+        media_urls = []
+        media_types = []
+        for img_url in image_urls:
+            try:
+                from gateway.platforms.base import cache_image_from_url
+                # Preserve original image format from URL
+                from urllib.parse import urlsplit
+                url_path = urlsplit(img_url).path
+                ext = os.path.splitext(url_path)[1] or ".jpg"
+                local_path = await cache_image_from_url(img_url, ext=ext)
+                media_urls.append(local_path)
+                # Map extension to MIME type
+                mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                            ".png": "image/png", ".gif": "image/gif",
+                            ".webp": "image/webp", ".svg": "image/svg+xml"}
+                media_types.append(mime_map.get(ext.lower(), "image/jpeg"))
+            except Exception as e:
+                logger.warning("Urbit: failed to cache image %s — %s", img_url[:80], e)
 
+        # Look up channel info for this nest
+        chan_info = self._channels.get(nest, {})
+        chan_title = chan_info.get("title", nest)
+        chan_type = chan_info.get("type", "chat")
+        chan_config = chan_info.get("config", {})
+
+        # Build message event — chat_id is the nest, giving each channel its own session
         source = self.build_source(
-            chat_id=self._channel_nest or "",
-            chat_name=self._channel_nest or "",
+            chat_id=nest or self._home_channel or "",
+            chat_name=chan_title,
             chat_type="group",
             user_id=author,
             user_name=author,
         )
 
+        # Resolve per-channel overrides from YAML config
+        channel_prompt = (chan_config.get("system_prompt") or "").strip() or None
+        skills = chan_config.get("skills")
+        auto_skill = skills if isinstance(skills, list) and skills else None
+
+        # Determine message type
+        msg_type = MessageType.PHOTO if media_urls else MessageType.TEXT
+
         event = MessageEvent(
-            text=text,
-            message_type=MessageType.TEXT,
+            text=text or "[image]",
+            message_type=msg_type,
             source=source,
-            raw_message={"post_id": post_id, "essay": essay},
+            raw_message={"post_id": post_id, "essay": essay, "nest": nest},
+            media_urls=media_urls,
+            media_types=media_types,
+            channel_prompt=channel_prompt,
+            auto_skill=auto_skill,
         )
 
-        logger.info("Urbit: message from %s: %s", author, text[:80])
+        logger.info("Urbit: [%s] message from %s: %s", chan_title or nest, author, (text or "[image]")[:80])
         await self.handle_message(event)
 
     @staticmethod
@@ -586,11 +937,77 @@ class UrbitAdapter(BasePlatformAdapter):
                 block = verse["block"]
                 if "code" in block:
                     parts.append(f"```\n{block['code'].get('code', '')}\n```")
-                elif "image" in block:
-                    parts.append(f"[image: {block['image'].get('alt', '')}]")
+                # Images are handled separately via _extract_image_urls_from_content
         return "".join(parts).strip()
 
+    @staticmethod
+    def _extract_image_urls_from_content(content: list) -> list:
+        """Extract image URLs from Tlon Story format content.
+
+        Returns a list of image source URLs found in block.image verses.
+        """
+        urls = []
+        for verse in content:
+            if "block" in verse:
+                block = verse["block"]
+                if "image" in block:
+                    src = block["image"].get("src", "")
+                    if src:
+                        urls.append(src)
+        return urls
+
+    # ── Commands ────────────────────────────────────────────────────────────
+
+    async def _handle_rescan_command(self, nest: str, author: str):
+        """Handle /rescan command — re-discover channels and subscribe to new ones."""
+        logger.info("Urbit: /rescan requested by %s in %s", author, nest)
+
+        result = await self.rescan_channels()
+
+        # Build human-readable reply
+        parts = ["⛵ **Channel rescan complete**\n"]
+        if result.get("error"):
+            parts.append(f"⚠️ {result['error']}")
+        else:
+            if result["added"]:
+                for n in result["added"]:
+                    info = self._channels.get(n, {})
+                    parts.append(f"➕ New: **{info.get('title', n)}** [{info.get('type', '?')}]")
+            if result["removed"]:
+                for n in result["removed"]:
+                    parts.append(f"➖ Removed: {n}")
+            if not result["added"] and not result["removed"]:
+                parts.append("No changes — all channels up to date.")
+            parts.append(f"\n📡 {len(self._channels)} channels active")
+
+        await self.send(nest, "\n".join(parts))
+
     # ── Sending ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _strip_reasoning_block(text: str) -> str:
+        """Strip the gateway's 💭 Reasoning block from outbound message text.
+
+        The gateway prepends reasoning as:
+            💭 **Reasoning:**
+            ```
+            <reasoning content>
+            ```
+
+            <actual response>
+
+        This method removes that prefix when show_reasoning is false.
+        """
+        import re
+        # Match the reasoning block: 💭 **Reasoning:** followed by a code fence
+        stripped = re.sub(
+            r'^💭\s*\*{0,2}Reasoning:?\*{0,2}\s*\n```\n.*?\n```\s*\n*',
+            '',
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+        return stripped.strip() or text
 
     async def send(
         self,
@@ -599,12 +1016,42 @@ class UrbitAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a message to the Urbit group chat channel via JSON poke."""
-        if not self._cookie or not self._channel_nest:
+        """Send a message to a Urbit channel via JSON poke.
+
+        chat_id is the channel nest (e.g. 'chat/~host/slug').
+        Falls back to the home channel if chat_id is not a known nest.
+        """
+        if not self._cookie or not self._eyre_channel_id:
             return SendResult(success=False, error="Not connected")
 
-        # Use the discovered channel nest (chat_id is usually the nest)
-        nest = self._channel_nest
+        # Resolve the target nest — chat_id should be a nest from build_source
+        nest = chat_id
+        if nest not in self._channels:
+            # Maybe it's a channel title? Try matching.
+            resolved = None
+            for n, info in self._channels.items():
+                if info["title"].lower() == nest.lower():
+                    resolved = n
+                    break
+            if resolved:
+                nest = resolved
+            elif self._home_channel:
+                logger.warning(
+                    "Urbit: chat_id '%s' not a known nest, falling back to home channel",
+                    chat_id,
+                )
+                nest = self._home_channel
+            else:
+                return SendResult(success=False, error=f"Unknown channel: {chat_id}")
+
+        # Per-channel show_reasoning filter
+        # The gateway may prepend 💭 **Reasoning:** blocks to the content.
+        # Strip them unless the channel's YAML config has show_reasoning: true.
+        chan_info = self._channels.get(nest, {})
+        chan_config = chan_info.get("config", {})
+        show_reasoning = chan_config.get("show_reasoning", False)
+        if not show_reasoning:
+            content = self._strip_reasoning_block(content)
 
         # Build the channel-action poke payload
         now_ms = int(time.time() * 1000)
@@ -666,10 +1113,11 @@ class UrbitAdapter(BasePlatformAdapter):
         return await self.send(chat_id, msg)
 
     async def get_chat_info(self, chat_id: str) -> dict:
-        """Return chat info for a given chat_id."""
+        """Return chat info for a given chat_id (nest)."""
+        chan_info = self._channels.get(chat_id, {})
         return {
-            "name": self._channel_nest or chat_id,
-            "type": "group",
+            "name": chan_info.get("title", chat_id),
+            "type": chan_info.get("type", "group"),
             "chat_id": chat_id,
         }
 
@@ -699,7 +1147,7 @@ def validate_config(config: PlatformConfig) -> bool:
 
 def is_connected(config: PlatformConfig) -> bool:
     """Quick check: is the adapter likely configured and connectable?"""
-    return validate_config(config) is None
+    return validate_config(config)
 
 
 def interactive_setup(current_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
